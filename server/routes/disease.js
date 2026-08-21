@@ -1,7 +1,8 @@
 import { Router } from 'express'
 import multer from 'multer'
 import Jimp from 'jimp'
-import { addScan, getScans } from '../db/index.js'
+import { nanoid } from 'nanoid'
+import { query, runAndPersist } from '../db.js'
 
 const router = Router()
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } })
@@ -32,7 +33,8 @@ const treatments = {
 
 // Real pixel-level heuristic: classifies each pixel as healthy-green,
 // stressed (yellow/brown/necrotic), or background, then derives a
-// severity ratio from the actual image content.
+// severity ratio AND a color signature from the actual image content.
+// Everything below is deterministic — same image bytes in, same result out.
 async function analyzeLeafImage(buffer) {
   const image = await Jimp.read(buffer)
   image.resize(160, Jimp.AUTO)
@@ -40,6 +42,9 @@ async function analyzeLeafImage(buffer) {
   let greenPixels = 0
   let stressedPixels = 0
   let totalLeafPixels = 0
+  let stressedRSum = 0
+  let stressedGSum = 0
+  let stressedBSum = 0
 
   image.scan(0, 0, image.bitmap.width, image.bitmap.height, function (x, y, idx) {
     const r = this.bitmap.data[idx + 0]
@@ -55,28 +60,61 @@ async function analyzeLeafImage(buffer) {
 
     if (isGreenish || isYellowBrown) {
       totalLeafPixels++
-      if (isYellowBrown) stressedPixels++
-      else greenPixels++
+      if (isYellowBrown) {
+        stressedPixels++
+        stressedRSum += r
+        stressedGSum += g
+        stressedBSum += b
+      } else {
+        greenPixels++
+      }
     }
   })
 
   const stressRatio = totalLeafPixels > 0 ? stressedPixels / totalLeafPixels : 0
-  return { stressRatio, totalLeafPixels }
+
+  // Average color of the stressed region — this is the deterministic
+  // "signature" used to pick a specific disease name below. Different
+  // discoloration patterns (yellow vs. reddish-brown vs. dark brown)
+  // naturally land on different signature values.
+  let colorSignature = 0
+  if (stressedPixels > 0) {
+    const avgR = stressedRSum / stressedPixels
+    const avgG = stressedGSum / stressedPixels
+    const avgB = stressedBSum / stressedPixels
+    // Redness dominance in [0,1] — higher means darker/redder-brown necrosis,
+    // lower means lighter yellow discoloration.
+    colorSignature = avgR / (avgR + avgG + avgB)
+  }
+
+  return { stressRatio, colorSignature, totalLeafPixels }
 }
 
-function classify(stressRatio, crop) {
+function classify(stressRatio, colorSignature, crop) {
   const catalog = diseaseCatalog[crop] || diseaseCatalog.Default
 
   if (stressRatio < 0.06) {
-    return { disease: 'Healthy', severity: 'None', confidence: Math.round(93 + Math.random() * 6) }
+    // Confidence scales with how little discoloration is present — closer
+    // to 0 stress ratio yields a confidence closer to 99, never random.
+    const confidence = Math.round(93 + Math.min(6, (0.06 - stressRatio) * 100))
+    return { disease: 'Healthy', severity: 'None', confidence: Math.min(confidence, 99) }
   }
 
-  const disease = catalog[Math.floor(Math.random() * catalog.length)]
+  // Deterministic bucket selection from the measured color signature,
+  // instead of Math.random() — identical images always land on the same index.
+  const index = Math.min(
+    catalog.length - 1,
+    Math.floor(colorSignature * catalog.length)
+  )
+  const disease = catalog[index]
+
   let severity = 'Low'
   if (stressRatio > 0.35) severity = 'High'
   else if (stressRatio > 0.15) severity = 'Medium'
 
-  const confidence = Math.round(72 + Math.min(24, stressRatio * 60) + Math.random() * 4)
+  // Confidence scales with how pronounced the stress signal is —
+  // stronger, clearer discoloration patterns yield higher confidence.
+  const confidence = Math.round(72 + Math.min(26, stressRatio * 70))
   return { disease, severity, confidence: Math.min(confidence, 98) }
 }
 
@@ -85,17 +123,24 @@ router.post('/scan', upload.single('image'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' })
     const crop = req.body.crop || 'Default'
 
-    const { stressRatio } = await analyzeLeafImage(req.file.buffer)
-    const { disease, severity, confidence } = classify(stressRatio, crop)
+    const { stressRatio, colorSignature } = await analyzeLeafImage(req.file.buffer)
+    const { disease, severity, confidence } = classify(stressRatio, colorSignature, crop)
 
-    const scan = addScan({
+    const scan = {
+      id: nanoid(8),
       crop,
       disease,
       severity,
       confidence,
       stressRatio: Math.round(stressRatio * 1000) / 1000,
       treatment: treatments[disease] || treatments['Early Blight'],
-    })
+      date: new Date().toISOString(),
+    }
+
+    runAndPersist(
+      'INSERT INTO scans (id, crop, disease, severity, confidence, stressRatio, treatment, date) VALUES (?,?,?,?,?,?,?,?)',
+      [scan.id, scan.crop, scan.disease, scan.severity, scan.confidence, scan.stressRatio, JSON.stringify(scan.treatment), scan.date]
+    )
 
     res.json(scan)
   } catch (err) {
@@ -106,7 +151,9 @@ router.post('/scan', upload.single('image'), async (req, res) => {
 
 router.get('/scans', (req, res) => {
   const limit = Number(req.query.limit) || 10
-  res.json(getScans(limit))
+  const rows = query('SELECT * FROM scans ORDER BY date DESC LIMIT ?', [limit])
+  const parsed = rows.map(r => ({ ...r, treatment: JSON.parse(r.treatment || '[]') }))
+  res.json(parsed)
 })
 
 export default router
