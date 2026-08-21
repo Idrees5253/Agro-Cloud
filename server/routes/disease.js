@@ -1,8 +1,7 @@
 import { Router } from 'express'
 import multer from 'multer'
 import Jimp from 'jimp'
-import { nanoid } from 'nanoid'
-import { query, runAndPersist } from '../db.js'
+import { addScan, getScans } from '../db/index.js'
 
 const router = Router()
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } })
@@ -115,32 +114,28 @@ function classify(stressRatio, colorSignature, crop) {
   // Confidence scales with how pronounced the stress signal is —
   // stronger, clearer discoloration patterns yield higher confidence.
   const confidence = Math.round(72 + Math.min(26, stressRatio * 70))
+
   return { disease, severity, confidence: Math.min(confidence, 98) }
 }
 
 router.post('/scan', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No image uploaded' })
-    const crop = req.body.crop || 'Default'
 
+    const crop = req.body.crop || 'Default'
+    const farmerId = req.body.farmerId || undefined
     const { stressRatio, colorSignature } = await analyzeLeafImage(req.file.buffer)
     const { disease, severity, confidence } = classify(stressRatio, colorSignature, crop)
 
-    const scan = {
-      id: nanoid(8),
+    const scan = addScan({
       crop,
       disease,
       severity,
       confidence,
       stressRatio: Math.round(stressRatio * 1000) / 1000,
       treatment: treatments[disease] || treatments['Early Blight'],
-      date: new Date().toISOString(),
-    }
-
-    runAndPersist(
-      'INSERT INTO scans (id, crop, disease, severity, confidence, stressRatio, treatment, date) VALUES (?,?,?,?,?,?,?,?)',
-      [scan.id, scan.crop, scan.disease, scan.severity, scan.confidence, scan.stressRatio, JSON.stringify(scan.treatment), scan.date]
-    )
+      farmerId,
+    })
 
     res.json(scan)
   } catch (err) {
@@ -151,9 +146,8 @@ router.post('/scan', upload.single('image'), async (req, res) => {
 
 router.get('/scans', (req, res) => {
   const limit = Number(req.query.limit) || 10
-  const rows = query('SELECT * FROM scans ORDER BY date DESC LIMIT ?', [limit])
-  const parsed = rows.map(r => ({ ...r, treatment: JSON.parse(r.treatment || '[]') }))
-  res.json(parsed)
+  const scans = getScans(limit)
+  res.json(scans)
 })
 
 export default router
