@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html { font-family: 'Inter', sans-serif; }
+  body { @apply bg-paper-dim text-ink antialiased; }
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #C9C1A8; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: #B3AA8C; }
+
+.contour-bg {
+  background-image:
+    repeating-radial-gradient(circle at 20% 30%, rgba(111,168,90,0.10) 0, rgba(111,168,90,0.10) 1px, transparent 1px, transparent 34px),
+    repeating-radial-gradient(circle at 80% 70%, rgba(232,163,61,0.08) 0, rgba(232,163,61,0.08) 1px, transparent 1px, transparent 46px);
+}
